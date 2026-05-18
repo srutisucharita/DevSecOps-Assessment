@@ -1,0 +1,43 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - echo Installing tools
+      - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      - wget -qO /tmp/sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+      - unzip -q /tmp/sonar-scanner.zip -d /opt
+
+  pre_build:
+    commands:
+      - export PATH=$PATH:/opt/sonar-scanner-5.0.1.3006-linux/bin
+      - cd api
+      - npm install
+      - echo Logging in to ECR
+      - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com
+      - COMMIT_ID=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=$COMMIT_ID-$CODEBUILD_BUILD_NUMBER
+      - IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/api-dev:$IMAGE_TAG
+      - echo Image URI is $IMAGE_URI
+
+  build:
+    commands:
+      - export PATH=$PATH:/opt/sonar-scanner-5.0.1.3006-linux/bin
+      - echo Running SonarQube scan
+      - sonar-scanner -Dsonar.projectKey=api-codebuild -Dsonar.sources=. -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.login=$SONAR_TOKEN
+      - echo Building Docker image
+      - docker build -t api-dev:$IMAGE_TAG .
+      - docker tag api-dev:$IMAGE_TAG $IMAGE_URI
+      - echo Running Trivy scan
+      - trivy image --format json --output trivy-report.json api-dev:$IMAGE_TAG || true
+
+  post_build:
+    commands:
+      - echo Pushing Docker image
+      - docker push $IMAGE_URI
+      - echo Build completed
+
+artifacts:
+  files:
+    - api/trivy-report.json
+    - api/**/*

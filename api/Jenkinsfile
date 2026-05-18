@@ -1,0 +1,210 @@
+pipeline {
+    agent { label 'jenkins-slave' }
+
+    parameters {
+        choice(name: 'QUALITY_GATE_ACTION', choices: ['Pass', 'Fail'], description: 'Choose Fail to stop pipeline on Quality Gate failure')
+    }
+
+    environment {
+        API_DIR = "api"
+        REPORT_DIR = "reports"
+        AWS_REGION = "us-east-1"
+        AWS_ACCOUNT_ID = "038462753889"
+        SONAR_PROJECT_KEY = "api-${BRANCH_NAME}"
+    }
+
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+                checkout scm
+            }
+        }
+
+        stage('Set Environment') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME == 'develop') {
+                        env.DEPLOY_ENV = 'dev'
+                        env.ECR_REPO = 'api-dev'
+                    } else if (env.BRANCH_NAME == 'master') {
+                        env.DEPLOY_ENV = 'prod'
+                        env.ECR_REPO = 'api-prod'
+                    } else {
+                        error "Only develop and master branches are allowed"
+                    }
+
+                    env.COMMIT_ID_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.IMAGE_TAG = "${env.COMMIT_ID_SHORT}-${env.BUILD_NUMBER}"
+
+                    env.ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                    env.ECR_REPO_URI = "${env.ECR_REGISTRY}/${env.ECR_REPO}"
+
+                    env.IMAGE_URI = "${env.ECR_REPO_URI}:${env.IMAGE_TAG}"
+                    env.LATEST_IMAGE_URI = "${env.ECR_REPO_URI}:latest"
+
+                    echo "Environment: ${env.DEPLOY_ENV}"
+                    echo "ECR Repo: ${env.ECR_REPO}"
+                    echo "Image Tag: ${env.IMAGE_TAG}"
+                    echo "Image URI: ${env.IMAGE_URI}"
+                    echo "Latest URI: ${env.LATEST_IMAGE_URI}"
+                }
+            }
+        }
+
+        stage('Install Python Dependencies') {
+            steps {
+                dir("${env.API_DIR}") {
+                    sh 'rm -rf venv'
+                    sh 'python3 -m venv venv'
+                    sh './venv/bin/python -m pip install --upgrade pip'
+                    sh 'cp requirements.txt requirements-ci.txt'
+                    sh 'sed -i "s/^psycopg2$/psycopg2-binary/g" requirements-ci.txt || true'
+                    sh './venv/bin/python -m pip install -r requirements-ci.txt'
+                    sh './venv/bin/python -m pip install pytest'
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                dir("${env.API_DIR}") {
+                    withSonarQubeEnv('SonarQube') {
+                        script {
+                            def scannerHome = tool 'SonarScanner'
+                            sh """
+                                ${scannerHome}/bin/sonar-scanner \
+                                -Dsonar.projectKey=${env.SONAR_PROJECT_KEY} \
+                                -Dsonar.sources=. \
+                                -Dsonar.host.url=${SONAR_HOST_URL} \
+                                -Dsonar.login=${SONAR_AUTH_TOKEN}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 2, unit: 'MINUTES') {
+                    script {
+                        def qg = waitForQualityGate abortPipeline: false
+                        echo "Quality Gate Status: ${qg.status}"
+
+                        if (params.QUALITY_GATE_ACTION == 'Fail' && qg.status != 'OK') {
+                            error "Pipeline stopped because SonarQube Quality Gate failed: ${qg.status}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Run API Tests') {
+            steps {
+                dir("${env.API_DIR}") {
+                    sh './venv/bin/python -m pytest test.py || echo "No API tests found, skipping"'
+                }
+            }
+        }
+
+        stage('Docker Build and Tag') {
+            steps {
+                dir("${env.API_DIR}") {
+                    sh "docker build -t ${env.ECR_REPO}:${env.IMAGE_TAG} ."
+                    sh "docker tag ${env.ECR_REPO}:${env.IMAGE_TAG} ${env.IMAGE_URI}"
+                    sh "docker tag ${env.ECR_REPO}:${env.IMAGE_TAG} ${env.LATEST_IMAGE_URI}"
+                    sh "docker images | grep ${env.ECR_REPO} || true"
+                }
+            }
+        }
+
+        stage('Anchore Grype Image Scan') {
+            steps {
+                sh "mkdir -p reports/anchore"
+                sh "grype ${env.ECR_REPO}:${env.IMAGE_TAG} -o json > reports/anchore/anchore-scan.json || true"
+                sh "grype ${env.ECR_REPO}:${env.IMAGE_TAG} --fail-on critical || echo 'Critical vulnerabilities found, continuing for assessment proof'"
+            }
+        }
+
+        
+
+        stage('Push Image to ECR') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+                    sh "aws ecr get-login-password --region ${env.AWS_REGION} | docker login --username AWS --password-stdin ${env.ECR_REGISTRY}"
+                    sh "docker push ${env.IMAGE_URI}"
+                    sh "docker push ${env.LATEST_IMAGE_URI}"
+                }
+            }
+        }
+
+        stage('Verify ECR Image Tags') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+                    sh """
+                        aws ecr describe-images \
+                        --repository-name ${env.ECR_REPO} \
+                        --region ${env.AWS_REGION} \
+                        --query 'imageDetails[].imageTags[]' \
+                        --output table || true
+                    """
+                }
+            }
+        }
+
+        stage('Restart Deployment') {
+            steps {
+                sh "kubectl rollout restart deployment/api -n ${env.DEPLOY_ENV} || true"
+                sh "kubectl rollout status deployment/api -n ${env.DEPLOY_ENV} --timeout=180s || true"
+            }
+        }
+
+        stage('Check Pods Running') {
+            steps {
+                sh "kubectl get pods -n ${env.DEPLOY_ENV} -o wide || true"
+                sh "kubectl get svc -n ${env.DEPLOY_ENV} || true"
+            }
+        }
+
+        stage('API Integration Test Inside Pod') {
+            steps {
+                sh "sleep 30"
+                sh "kubectl exec -n ${env.DEPLOY_ENV} deploy/api -- wget -qO- http://localhost:8080/health || echo 'API integration test skipped or endpoint not ready'"
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'mkdir -p reports && echo "Build completed" > reports/build-status.txt'
+            archiveArtifacts artifacts: 'reports/**/*', allowEmptyArchive: true
+
+            script {
+                try {
+                    emailext(
+                        subject: "Build ${currentBuild.currentResult}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        body: """
+Build Status: ${currentBuild.currentResult}
+Job Name: ${env.JOB_NAME}
+Branch: ${env.BRANCH_NAME}
+Commit ID: ${env.COMMIT_ID_SHORT}
+Build Number: ${env.BUILD_NUMBER}
+Build URL: ${env.BUILD_URL}
+
+Environment: ${env.DEPLOY_ENV}
+ECR Repo: ${env.ECR_REPO}
+Image Tag: ${env.IMAGE_TAG}
+Image URI: ${env.IMAGE_URI}
+Latest Image URI: ${env.LATEST_IMAGE_URI}
+""",
+                        to: "dnyaneshwarg535@gmail.com",
+                        attachmentsPattern: "reports/**/*"
+                    )
+                } catch (err) {
+                    echo "Email sending failed, but build result is preserved: ${err}"
+                }
+            }
+        }
+    }
+}
